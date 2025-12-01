@@ -5,7 +5,8 @@ TRUNCATE TABLE artists;
 TRUNCATE TABLE singers;
 TRUNCATE TABLE music_directors;
 TRUNCATE TABLE albums;
-SET FOREIGN_KEY_CHECKS = 1;
+TRUNCATE TABLE users;
+
 
 -- === INSERT UNKNOWN RECORDS FOR ID=1 ===
 -- Note: These will get id=1 due to AUTO_INCREMENT starting at 1
@@ -7343,3 +7344,4 @@ VALUES ('-SS Thaman', COALESCE((SELECT id FROM albums WHERE title='-Akhanda 2'),
 ('Mani Sharma', COALESCE((SELECT id FROM albums WHERE title='Billa'),1), 'Billa'),
 ('Sandeep Chowta', COALESCE((SELECT id FROM albums WHERE title='Bujjigadu'),1), 'Bujjigadu'),
 ('Radha Krishna KM', COALESCE((SELECT id FROM albums WHERE title='Baladoor'),1), 'Baladoor');
+SET FOREIGN_KEY_CHECKS = 1;
