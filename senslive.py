@@ -14,6 +14,7 @@ from pathlib import Path
 from textwrap import indent
 from typing import Any
 from urllib.parse import quote, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gzip
 import zlib
@@ -206,6 +207,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 		type=Path,
 		help="Save scraped songs to CSV file (use with --scrape-article or --scrape-articles-from-csv)",
 	)
+	parser.add_argument(
+		"--workers",
+		type=int,
+		default=5,
+		help="Number of parallel workers for scraping (default: 5)",
+	)
+	parser.add_argument(
+		"--batch-size",
+		type=int,
+		default=10,
+		help="Batch size for parallel processing (default: 10)",
+	)
 	return parser.parse_args(argv)
 
 
@@ -363,6 +376,54 @@ def scrape_all_tag_pages(tag_name: str, timeout: int = DEFAULT_TIMEOUT) -> list[
 			break
 	
 	return all_articles
+
+
+def scrape_all_tag_pages_parallel(tags: list[str], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple tags in parallel using ThreadPoolExecutor."""
+	
+	all_articles = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all tag scraping tasks
+		future_to_tag = {executor.submit(scrape_all_tag_pages, tag, timeout): tag for tag in tags}
+		
+		# Process completed tasks as they finish
+		for future in as_completed(future_to_tag):
+			tag = future_to_tag[future]
+			try:
+				articles = future.result()
+				all_articles.extend(articles)
+				print(f"✓ Completed tag '{tag}': {len(articles)} articles", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ Error scraping tag '{tag}': {e}", file=sys.stderr)
+	
+	return all_articles
+
+
+def scrape_articles_batch(article_urls: list[str], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple articles in parallel using ThreadPoolExecutor."""
+	
+	all_results = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all article scraping tasks
+		future_to_url = {executor.submit(scrape_article_details, url, timeout): url for url in article_urls}
+		
+		# Process completed tasks as they finish
+		for i, future in enumerate(as_completed(future_to_url), 1):
+			url = future_to_url[future]
+			try:
+				result = future.result()
+				if 'error' not in result:
+					all_results.append(result)
+					songs_count = len(result.get('songs', []))
+					print(f"✓ [{i}/{len(article_urls)}] {url[:60]}... ({songs_count} songs)", file=sys.stderr)
+				else:
+					print(f"✗ [{i}/{len(article_urls)}] Error: {result['error']}", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ [{i}/{len(article_urls)}] Exception: {e}", file=sys.stderr)
+	
+	return all_results
 
 
 def generate_tag_list(characters: str = "1abcdefghijklmnopqrstuvwxyz") -> list[str]:
@@ -883,17 +944,23 @@ def main(argv: list[str] | None = None) -> int:
 			return 1
 		
 		print(f"Found {len(article_urls)} articles to scrape", file=sys.stderr)
+		print(f"Using {args.workers} parallel workers with batch size {args.batch_size}", file=sys.stderr)
 		
-		# Scrape all articles
+		# Scrape all articles in parallel with batching
 		all_songs = []
-		for i, url in enumerate(article_urls, 1):
-			print(f"Scraping [{i}/{len(article_urls)}]: {url[:60]}...", file=sys.stderr)
-			article_data = scrape_article_details(url, timeout=args.timeout)
+		batch_size = args.batch_size
+		
+		for batch_start in range(0, len(article_urls), batch_size):
+			batch_end = min(batch_start + batch_size, len(article_urls))
+			batch_urls = article_urls[batch_start:batch_end]
 			
-			if 'error' not in article_data:
-				all_songs.append(article_data)
-			else:
-				print(f"  ✗ Error: {article_data['error']}", file=sys.stderr)
+			print(f"\n{'='*70}", file=sys.stderr)
+			print(f"Processing batch {batch_start//batch_size + 1}/{(len(article_urls) + batch_size - 1)//batch_size}", file=sys.stderr)
+			print(f"Articles {batch_start + 1} to {batch_end} of {len(article_urls)}", file=sys.stderr)
+			print(f"{'='*70}", file=sys.stderr)
+			
+			batch_results = scrape_articles_batch(batch_urls, timeout=args.timeout, workers=args.workers)
+			all_songs.extend(batch_results)
 		
 		# Combine all articles while preserving album details for each song
 		all_articles_with_songs = []
@@ -952,16 +1019,29 @@ def main(argv: list[str] | None = None) -> int:
 			chars = [c.strip() for c in args.scrape_tags.split(',')]
 			tags = generate_tag_list(characters=''.join(chars))
 		
-		print(f"Starting to scrape {len(tags)} tags...", file=sys.stderr)
+		print(f"Starting to scrape {len(tags)} tags with {args.workers} parallel workers...", file=sys.stderr)
+		print(f"{'='*70}", file=sys.stderr)
 		
-		for tag in tags:
-			articles = scrape_all_tag_pages(tag, timeout=args.timeout)
-			all_articles.extend(articles)
-			print(f"✓ {tag}: {len(articles)} articles", file=sys.stderr)
+		# Process tags in batches for better control
+		batch_size = args.batch_size
+		all_articles = []
+		
+		for batch_start in range(0, len(tags), batch_size):
+			batch_end = min(batch_start + batch_size, len(tags))
+			batch_tags = tags[batch_start:batch_end]
+			
+			print(f"\nProcessing tag batch {batch_start//batch_size + 1}/{(len(tags) + batch_size - 1)//batch_size}", file=sys.stderr)
+			print(f"Tags: {', '.join(batch_tags)}", file=sys.stderr)
+			print(f"{'-'*70}", file=sys.stderr)
+			
+			batch_articles = scrape_all_tag_pages_parallel(batch_tags, timeout=args.timeout, workers=args.workers)
+			all_articles.extend(batch_articles)
+		
+		print(f"\n{'='*70}", file=sys.stderr)
 		
 		if args.tags_output:
 			output_file = save_articles_to_csv(all_articles, args.tags_output)
-			print(f"\n✓ Saved {len(all_articles)} total articles to {output_file.resolve()}")
+			print(f"✓ Saved {len(all_articles)} total articles to {output_file.resolve()}", file=sys.stderr)
 		else:
 			print(f"\n✓ Found {len(all_articles)} total articles")
 			for article in all_articles[:5]:  # Show first 5

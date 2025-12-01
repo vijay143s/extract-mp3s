@@ -44,37 +44,19 @@ def generate_sql_from_csv(csv_file, output_file):
     # Generate SQL
     sql_lines = []
     
-    # === TRUNCATE ALL TABLES ===
-    sql_lines.append("-- === TRUNCATE ALL TABLES ===")
-    sql_lines.append("SET FOREIGN_KEY_CHECKS = 0;")
-    sql_lines.append("TRUNCATE TABLE songs;")
-    sql_lines.append("TRUNCATE TABLE artists;")
-    sql_lines.append("TRUNCATE TABLE singers;")
-    sql_lines.append("TRUNCATE TABLE music_directors;")
-    sql_lines.append("TRUNCATE TABLE albums;")
-    sql_lines.append("SET FOREIGN_KEY_CHECKS = 1;")
-    sql_lines.append("")
-    
-    # === INSERT UNKNOWN RECORDS (ID=1) FOR ALL TABLES ===
-    sql_lines.append("-- === INSERT UNKNOWN RECORDS FOR ID=1 ===")
-    sql_lines.append("-- Note: These will get id=1 due to AUTO_INCREMENT starting at 1")
-    sql_lines.append("INSERT IGNORE INTO albums (title, description, thumbnail_id, thumbnail_url, year, director, music_director, star_cast)")
-    sql_lines.append("VALUES ('Unknown', 'Unknown Album', NULL, NULL, NULL, 'Unknown', 'Unknown', 'Unknown');")
-    sql_lines.append("")
-    sql_lines.append("INSERT IGNORE INTO singers (singer_name)")
-    sql_lines.append("VALUES ('Unknown');")
-    sql_lines.append("")
-    sql_lines.append("INSERT IGNORE INTO artists (artist_name, album_id, album_name)")
-    sql_lines.append("VALUES ('Unknown', 1, 'Unknown');")
-    sql_lines.append("")
-    sql_lines.append("INSERT IGNORE INTO music_directors (director_name, album_id, album_name)")
-    sql_lines.append("VALUES ('Unknown', 1, 'Unknown');")
-    sql_lines.append("")
-    
+    sql_lines.append("-- SQL Generated from CSV")
+    sql_lines.append("-- Cleanup existing data")
+    sql_lines.append("TRUNCATE TABLE user_playlists CASCADE;")
+    sql_lines.append("TRUNCATE TABLE singers CASCADE;")
+    sql_lines.append("TRUNCATE TABLE music_directors CASCADE;")
+    sql_lines.append("TRUNCATE TABLE artists CASCADE;")
+    sql_lines.append("TRUNCATE TABLE songs CASCADE;")
+    sql_lines.append("TRUNCATE TABLE albums CASCADE;")
+    sql_lines.append("TRUNCATE TABLE users CASCADE;")
+    sql_lines.append("INSERT INTO albums (title, description) VALUES ('Unknown Album', 'Fallback album for songs without valid album references');")
     # === Albums ===
     sql_lines.append("-- === INSERT ALBUMS ===")
     album_vars = {}  # Map album names to variable names
-    album_values = []
     
     for album_name in sorted(albums.keys()):
         album_data = albums[album_name]
@@ -91,56 +73,47 @@ def generate_sql_from_csv(csv_file, output_file):
         music_director = escape_sql_string(album_data['music_director'])
         star_cast = escape_sql_string(album_data['star_cast'])
         
-        album_values.append(f"({title}, {description}, NULL, {thumbnail_url}, {year}, {director}, {music_director}, {star_cast})")
+        sql_lines.append(f"INSERT INTO albums (title, description, thumbnail_id, thumbnail_url, year, director, music_director, star_cast) VALUES ({title}, {description}, NULL, {thumbnail_url}, {year}, {director}, {music_director}, {star_cast});")
     
-    sql_lines.append("INSERT IGNORE INTO albums (title, description, thumbnail_id, thumbnail_url, year, director, music_director, star_cast)")
-    sql_lines.append("VALUES " + ",\n".join(album_values) + ";")
     sql_lines.append("")
     
     # === Songs ===
     sql_lines.append("-- === INSERT SONGS ===")
-    song_values = []
     
     for row in songs_list:
         album_name = row['album_name'].strip()
-        album_id = f"COALESCE((SELECT id FROM albums WHERE title={escape_sql_string(album_name)}),1)"
+        album_id = f"(SELECT id FROM albums WHERE title={escape_sql_string(album_name)})"
         song_title = escape_sql_string(row['song_title'])
         description = escape_sql_string(row['singers'])  # Use singers as description
         singer = escape_sql_string(row['singers'])
         thumbnail_url = escape_sql_string(row['thumbnail_url'])  # Use album thumbnail for song
         audio_url = escape_sql_string(row['download_link'])  # Use download_link as audio_url
         
-        song_values.append(f"({album_id}, {song_title}, {description}, {singer}, NULL, {thumbnail_url}, NULL, {audio_url})")
+        sql_lines.append(f"INSERT INTO songs (album_id, title, description, singer, thumbnail_id, thumbnail_url, audio_id, audio_url) VALUES ({album_id}, {song_title}, {description}, {singer}, NULL, {thumbnail_url}, NULL, {audio_url});")
     
-    sql_lines.append("INSERT IGNORE INTO songs (album_id, title, description, singer, thumbnail_id, thumbnail_url, audio_id, audio_url)")
-    sql_lines.append("VALUES " + ",\n".join(song_values) + ";")
     sql_lines.append("")
     
     # === Artists (from star_cast) ===
     sql_lines.append("-- === INSERT ARTISTS ===")
     artists_inserted = set()
-    artist_values = []
     
     for album_name, album_data in albums.items():
         if album_data['star_cast']:
-            album_id_subquery = f"COALESCE((SELECT id FROM albums WHERE title={escape_sql_string(album_name)}),1)"
+            album_id_subquery = f"(SELECT id FROM albums WHERE title={escape_sql_string(album_name)})"
             # Split star_cast by comma
             artists = [a.strip() for a in album_data['star_cast'].split(',')]
             for artist in artists:
                 if artist and (artist, album_name) not in artists_inserted:
                     artist_name = escape_sql_string(artist)
                     album_name_escaped = escape_sql_string(album_name)
-                    artist_values.append(f"({artist_name}, {album_id_subquery}, {album_name_escaped})")
+                    sql_lines.append(f"INSERT INTO artists (artist_name, album_id, album_name) VALUES ({artist_name}, {album_id_subquery}, {album_name_escaped});")
                     artists_inserted.add((artist, album_name))
     
-    sql_lines.append("INSERT IGNORE INTO artists (artist_name, album_id, album_name)")
-    sql_lines.append("VALUES " + ",\n".join(artist_values) + ";")
     sql_lines.append("")
     
     # === Singers (from song singers field) ===
     sql_lines.append("-- === INSERT SINGERS ===")
     singers_inserted = set()
-    singer_values = []
     
     for row in songs_list:
         if row['singers']:
@@ -149,28 +122,23 @@ def generate_sql_from_csv(csv_file, output_file):
             for singer in singers:
                 if singer and singer not in singers_inserted:
                     singer_name = escape_sql_string(singer)
-                    singer_values.append(f"({singer_name})")
+                    sql_lines.append(f"INSERT INTO singers (singer_name) VALUES ({singer_name});")
                     singers_inserted.add(singer)
     
-    sql_lines.append("INSERT IGNORE INTO singers (singer_name)")
-    sql_lines.append("VALUES " + ",\n".join(singer_values) + ";")
     sql_lines.append("")
     
     # === Music Directors ===
     sql_lines.append("-- === INSERT MUSIC DIRECTORS ===")
     music_directors_inserted = set()
-    director_values = []
     
     for album_name, album_data in albums.items():
         if album_data['music_director'] and (album_data['music_director'], album_name) not in music_directors_inserted:
-            album_id_subquery = f"COALESCE((SELECT id FROM albums WHERE title={escape_sql_string(album_name)}),1)"
+            album_id_subquery = f"(SELECT id FROM albums WHERE title={escape_sql_string(album_name)})"
             director_name = escape_sql_string(album_data['music_director'])
             album_name_escaped = escape_sql_string(album_name)
-            director_values.append(f"({director_name}, {album_id_subquery}, {album_name_escaped})")
+            sql_lines.append(f"INSERT INTO music_directors (director_name, album_id, album_name) VALUES ({director_name}, {album_id_subquery}, {album_name_escaped});")
             music_directors_inserted.add((album_data['music_director'], album_name))
     
-    sql_lines.append("INSERT IGNORE INTO music_directors (director_name, album_id, album_name)")
-    sql_lines.append("VALUES " + ",\n".join(director_values) + ";")
     sql_lines.append("")
     
     # Write to file

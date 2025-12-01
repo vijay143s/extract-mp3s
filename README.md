@@ -296,6 +296,8 @@ optional arguments:
   --scrape-articles-from-csv SCRAPE_ARTICLES_FROM_CSV
                                 CSV file with article URLs to scrape
   --songs-output SONGS_OUTPUT   Save scraped songs to CSV file
+  --workers WORKERS             Number of parallel workers (default: 5)
+  --batch-size BATCH_SIZE       Batch size for parallel processing (default: 10)
 ```
 
 ## Usage Examples
@@ -336,13 +338,13 @@ python senslive.py --scrape-article "https://sensongsmp3.live/araku-road-lo-mp3-
 
 Output: `colour_photo_songs.csv` with all songs, their details, and download links (320 Kbps preferred)
 
-### Example 7: Complete pipeline - scrape tags then articles
+### Example 7: Complete pipeline - scrape tags then articles (with parallel processing)
 ```bash
-# Step 1: Scrape specific tags for article URLs
-python senslive.py --scrape-tags "a,b" --tags-output articles.csv
+# Step 1: Scrape specific tags for article URLs (parallel processing with 10 workers)
+python senslive.py --scrape-tags "a,b" --tags-output articles.csv --workers 10 --batch-size 5
 
-# Step 2: Scrape all articles to get songs
-python senslive.py --scrape-articles-from-csv articles.csv --songs-output all_songs.csv
+# Step 2: Scrape all articles to get songs (parallel processing with 10 workers)
+python senslive.py --scrape-articles-from-csv articles.csv --songs-output all_songs.csv --workers 10 --batch-size 20
 ```
 
 Output: `all_songs.csv` with complete data including:
@@ -352,14 +354,20 @@ Output: `all_songs.csv` with complete data including:
 - High-quality (320 Kbps) download links
 - Year and language information
 
-### Example 8: Scrape all tags and articles in complete workflow
+### Example 8: Scrape all tags and articles in complete workflow (optimized with parallel processing)
 ```bash
-# Scrape all 27 tags for articles
-python senslive.py --scrape-all-tags --tags-output all_articles.csv
+# Scrape all 27 tags for articles with 15 parallel workers
+python senslive.py --scrape-all-tags --tags-output all_articles.csv --workers 15 --batch-size 10
 
-# Then scrape all articles for songs
-python senslive.py --scrape-articles-from-csv all_articles.csv --songs-output complete_songlist.csv
+# Then scrape all articles for songs with 20 parallel workers
+python senslive.py --scrape-articles-from-csv all_articles.csv --songs-output complete_songlist.csv --workers 20 --batch-size 50
 ```
+
+**Performance Notes:**
+- Default workers: 5 (use `--workers` to adjust)
+- Default batch size: 10 for tags, 10 for articles (use `--batch-size` to adjust)
+- Higher workers = faster but more network load
+- Recommended: 10-20 workers for large scraping jobs
 
 ## Output Files
 
