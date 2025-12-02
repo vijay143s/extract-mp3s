@@ -1,0 +1,34 @@
+# Environment and credentials
+.env
+
+# Old CSV files (use sql_output/ instead)
+*.csv
+all_songs.csv
+all-articles.csv
+
+# Old SQL files (use sql_output/ instead)
+all_songs.sql
+
+# Batch scripts (keep run_ingestion.bat and cleanup.bat)
+*.bat
+!run_ingestion.bat
+!cleanup.bat
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+
+# SQL output (generated)
+sql_output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
