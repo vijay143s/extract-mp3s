@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from textwrap import indent
@@ -400,6 +401,70 @@ def scrape_all_tag_pages_parallel(tags: list[str], timeout: int = DEFAULT_TIMEOU
 	return all_articles
 
 
+def extract_album_year_from_title(title: str) -> tuple[str, str]:
+	"""Extract album name and year from title like 'Permalink to: Album Name (2024)'."""
+	
+	album_name = ''
+	year = ''
+	
+	# Remove 'Permalink to: ' prefix if present
+	if title.startswith('Permalink to: '):
+		title = title[len('Permalink to: '):]
+	
+	# Extract year from pattern like "Album Name (2024)"
+	year_match = re.search(r'\((\d{4})\)$', title)
+	if year_match:
+		year = year_match.group(1)
+		# Remove the (year) part to get album name
+		album_name = title[:year_match.start()].strip()
+	else:
+		album_name = title
+	
+	return album_name, year
+
+
+def scrape_articles_batch_with_metadata(article_data_list: list[dict], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple articles in parallel with metadata (title, image) from CSV."""
+	
+	all_results = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all article scraping tasks
+		future_to_data = {executor.submit(scrape_article_details, article['href'], timeout): article for article in article_data_list}
+		
+		# Process completed tasks as they finish
+		for i, future in enumerate(as_completed(future_to_data), 1):
+			article_data = future_to_data[future]
+			url = article_data['href']
+			try:
+				result = future.result()
+				if 'error' not in result:
+					# Extract album name and year from title
+					title_album, title_year = extract_album_year_from_title(article_data['title'])
+					
+					# Priority: use title data first, then scraped data
+					album_details = result.get('album_details', {})
+					if title_album:
+						album_details['album_name'] = title_album
+					if title_year:
+						album_details['year'] = title_year
+					
+					result['album_details'] = album_details
+					
+					# Add thumbnail from CSV
+					result['thumbnail_url'] = article_data.get('image_src', '')
+					
+					all_results.append(result)
+					songs_count = len(result.get('songs', []))
+					print(f"✓ [{i}/{len(article_data_list)}] {url[:60]}... ({songs_count} songs)", file=sys.stderr)
+				else:
+					print(f"✗ [{i}/{len(article_data_list)}] Error: {result['error']}", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ [{i}/{len(article_data_list)}] Exception: {e}", file=sys.stderr)
+	
+	return all_results
+
+
 def scrape_articles_batch(article_urls: list[str], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
 	"""Scrape multiple articles in parallel using ThreadPoolExecutor."""
 	
@@ -492,7 +557,7 @@ def extract_album_details(soup: BeautifulSoup) -> dict[str, str]:
 								details['music_director'] = value_part
 							elif 'directer' in key_part or 'director' in key_part:
 								details['director'] = value_part
-							elif 'year' in key_part:
+							elif any(kw in key_part for kw in ['year', 'release', 'released', 'date']):
 								details['year'] = value_part
 							elif 'quality' in key_part:
 								details['audio_quality'] = value_part
@@ -529,7 +594,7 @@ def extract_album_details(soup: BeautifulSoup) -> dict[str, str]:
 						details['music_director'] = value_part
 					elif any(keyword in key_part for keyword in ['director', 'directer', 'directed by']):
 						details['director'] = value_part
-					elif any(keyword in key_part for keyword in ['year', 'release', 'released']):
+					elif any(keyword in key_part for keyword in ['year', 'release', 'released', 'date']):
 						details['year'] = value_part
 					elif any(keyword in key_part for keyword in ['quality', 'audio quality']):
 						details['audio_quality'] = value_part
@@ -931,35 +996,39 @@ def main(argv: list[str] | None = None) -> int:
 			print(f"✗ CSV file not found: {csv_path}")
 			return 1
 		
-		# Read article URLs from CSV
-		article_urls = []
+		# Read article data (href, image_src, title) from CSV
+		article_data_list = []
 		try:
 			with open(csv_path, 'r', encoding='utf-8') as f:
 				reader = csv.DictReader(f)
 				for row in reader:
 					if 'href' in row:
-						article_urls.append(row['href'])
+						article_data_list.append({
+							'href': row['href'],
+							'image_src': row.get('image_src', ''),
+							'title': row.get('title', '')
+						})
 		except Exception as e:
 			print(f"✗ Error reading CSV: {e}")
 			return 1
 		
-		print(f"Found {len(article_urls)} articles to scrape", file=sys.stderr)
+		print(f"Found {len(article_data_list)} articles to scrape", file=sys.stderr)
 		print(f"Using {args.workers} parallel workers with batch size {args.batch_size}", file=sys.stderr)
 		
-		# Scrape all articles in parallel with batching
+		# Scrape all articles in parallel with batching and metadata
 		all_songs = []
 		batch_size = args.batch_size
 		
-		for batch_start in range(0, len(article_urls), batch_size):
-			batch_end = min(batch_start + batch_size, len(article_urls))
-			batch_urls = article_urls[batch_start:batch_end]
+		for batch_start in range(0, len(article_data_list), batch_size):
+			batch_end = min(batch_start + batch_size, len(article_data_list))
+			batch_data = article_data_list[batch_start:batch_end]
 			
 			print(f"\n{'='*70}", file=sys.stderr)
-			print(f"Processing batch {batch_start//batch_size + 1}/{(len(article_urls) + batch_size - 1)//batch_size}", file=sys.stderr)
-			print(f"Articles {batch_start + 1} to {batch_end} of {len(article_urls)}", file=sys.stderr)
+			print(f"Processing batch {batch_start//batch_size + 1}/{(len(article_data_list) + batch_size - 1)//batch_size}", file=sys.stderr)
+			print(f"Articles {batch_start + 1} to {batch_end} of {len(article_data_list)}", file=sys.stderr)
 			print(f"{'='*70}", file=sys.stderr)
 			
-			batch_results = scrape_articles_batch(batch_urls, timeout=args.timeout, workers=args.workers)
+			batch_results = scrape_articles_batch_with_metadata(batch_data, timeout=args.timeout, workers=args.workers)
 			all_songs.extend(batch_results)
 		
 		# Combine all articles while preserving album details for each song
