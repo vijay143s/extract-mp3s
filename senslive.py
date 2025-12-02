@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from textwrap import indent
 from typing import Any
 from urllib.parse import quote, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gzip
 import zlib
@@ -206,6 +208,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 		type=Path,
 		help="Save scraped songs to CSV file (use with --scrape-article or --scrape-articles-from-csv)",
 	)
+	parser.add_argument(
+		"--sql-output",
+		type=Path,
+		help="Directory to save SQL INSERT files (albums.sql, songs.sql, etc.)",
+	)
+	parser.add_argument(
+		"--workers",
+		type=int,
+		default=5,
+		help="Number of parallel workers for scraping (default: 5)",
+	)
+	parser.add_argument(
+		"--batch-size",
+		type=int,
+		default=10,
+		help="Batch size for parallel processing (default: 10)",
+	)
 	return parser.parse_args(argv)
 
 
@@ -365,6 +384,118 @@ def scrape_all_tag_pages(tag_name: str, timeout: int = DEFAULT_TIMEOUT) -> list[
 	return all_articles
 
 
+def scrape_all_tag_pages_parallel(tags: list[str], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple tags in parallel using ThreadPoolExecutor."""
+	
+	all_articles = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all tag scraping tasks
+		future_to_tag = {executor.submit(scrape_all_tag_pages, tag, timeout): tag for tag in tags}
+		
+		# Process completed tasks as they finish
+		for future in as_completed(future_to_tag):
+			tag = future_to_tag[future]
+			try:
+				articles = future.result()
+				all_articles.extend(articles)
+				print(f"✓ Completed tag '{tag}': {len(articles)} articles", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ Error scraping tag '{tag}': {e}", file=sys.stderr)
+	
+	return all_articles
+
+
+def extract_album_year_from_title(title: str) -> tuple[str, str]:
+	"""Extract album name and year from title like 'Permalink to: Album Name (2024)'."""
+	
+	album_name = ''
+	year = ''
+	
+	# Remove 'Permalink to: ' prefix if present
+	if title.startswith('Permalink to: '):
+		title = title[len('Permalink to: '):]
+	
+	# Extract year from pattern like "Album Name (2024)"
+	year_match = re.search(r'\((\d{4})\)$', title)
+	if year_match:
+		year = year_match.group(1)
+		# Remove the (year) part to get album name
+		album_name = title[:year_match.start()].strip()
+	else:
+		album_name = title
+	
+	return album_name, year
+
+
+def scrape_articles_batch_with_metadata(article_data_list: list[dict], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple articles in parallel with metadata (title, image) from CSV."""
+	
+	all_results = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all article scraping tasks
+		future_to_data = {executor.submit(scrape_article_details, article['href'], timeout): article for article in article_data_list}
+		
+		# Process completed tasks as they finish
+		for i, future in enumerate(as_completed(future_to_data), 1):
+			article_data = future_to_data[future]
+			url = article_data['href']
+			try:
+				result = future.result()
+				if 'error' not in result:
+					# Extract album name and year from title
+					title_album, title_year = extract_album_year_from_title(article_data['title'])
+					
+					# Priority: use title data first, then scraped data
+					album_details = result.get('album_details', {})
+					if title_album:
+						album_details['album_name'] = title_album
+					if title_year:
+						album_details['year'] = title_year
+					
+					result['album_details'] = album_details
+					
+					# Add thumbnail from CSV
+					result['thumbnail_url'] = article_data.get('image_src', '')
+					
+					all_results.append(result)
+					songs_count = len(result.get('songs', []))
+					print(f"✓ [{i}/{len(article_data_list)}] {url[:60]}... ({songs_count} songs)", file=sys.stderr)
+				else:
+					print(f"✗ [{i}/{len(article_data_list)}] Error: {result['error']}", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ [{i}/{len(article_data_list)}] Exception: {e}", file=sys.stderr)
+	
+	return all_results
+
+
+def scrape_articles_batch(article_urls: list[str], timeout: int = DEFAULT_TIMEOUT, workers: int = 5) -> list[dict]:
+	"""Scrape multiple articles in parallel using ThreadPoolExecutor."""
+	
+	all_results = []
+	
+	with ThreadPoolExecutor(max_workers=workers) as executor:
+		# Submit all article scraping tasks
+		future_to_url = {executor.submit(scrape_article_details, url, timeout): url for url in article_urls}
+		
+		# Process completed tasks as they finish
+		for i, future in enumerate(as_completed(future_to_url), 1):
+			url = future_to_url[future]
+			try:
+				result = future.result()
+				if 'error' not in result:
+					all_results.append(result)
+					songs_count = len(result.get('songs', []))
+					print(f"✓ [{i}/{len(article_urls)}] {url[:60]}... ({songs_count} songs)", file=sys.stderr)
+				else:
+					print(f"✗ [{i}/{len(article_urls)}] Error: {result['error']}", file=sys.stderr)
+			except Exception as e:
+				print(f"✗ [{i}/{len(article_urls)}] Exception: {e}", file=sys.stderr)
+	
+	return all_results
+
+
 def generate_tag_list(characters: str = "1abcdefghijklmnopqrstuvwxyz") -> list[str]:
 	"""Generate list of tags from character list."""
 	
@@ -431,7 +562,7 @@ def extract_album_details(soup: BeautifulSoup) -> dict[str, str]:
 								details['music_director'] = value_part
 							elif 'directer' in key_part or 'director' in key_part:
 								details['director'] = value_part
-							elif 'year' in key_part:
+							elif any(kw in key_part for kw in ['year', 'release', 'released', 'date']):
 								details['year'] = value_part
 							elif 'quality' in key_part:
 								details['audio_quality'] = value_part
@@ -468,7 +599,7 @@ def extract_album_details(soup: BeautifulSoup) -> dict[str, str]:
 						details['music_director'] = value_part
 					elif any(keyword in key_part for keyword in ['director', 'directer', 'directed by']):
 						details['director'] = value_part
-					elif any(keyword in key_part for keyword in ['year', 'release', 'released']):
+					elif any(keyword in key_part for keyword in ['year', 'release', 'released', 'date']):
 						details['year'] = value_part
 					elif any(keyword in key_part for keyword in ['quality', 'audio quality']):
 						details['audio_quality'] = value_part
@@ -824,6 +955,219 @@ def save_article_details_to_csv(article_data: dict, output_path: Path | str, mod
 	return output_path
 
 
+class SQLDataCollector:
+	"""Collect and deduplicate data for SQL INSERT statements."""
+	
+	def __init__(self):
+		self.albums = {}  # key: album_name -> album_data
+		self.songs = []  # list of song data
+		self.artists = set()  # set of (artist_name, album_name) tuples
+		self.singers = set()  # set of singer names
+		self.music_directors = set()  # set of (director_name, album_name) tuples
+	
+	def add_article_data(self, article_data: dict):
+		"""Add article data to the collector."""
+		album_details = article_data.get('album_details', {})
+		thumbnail_url = article_data.get('thumbnail_url', '')
+		songs = article_data.get('songs', [])
+		
+		album_name = album_details.get('album_name', '').strip()
+		if not album_name:
+			return
+		
+		# Add album (deduplicate by album_name)
+		if album_name not in self.albums:
+			year = album_details.get('year', '').strip()
+			# Try to parse year as integer
+			year_int = None
+			if year:
+				try:
+					year_int = int(year)
+				except ValueError:
+					# Extract first 4 digits if present
+					year_match = re.search(r'\b(\d{4})\b', year)
+					if year_match:
+						year_int = int(year_match.group(1))
+			
+			self.albums[album_name] = {
+				'title': album_name,
+				'year': year_int,
+				'director': album_details.get('director', '').strip(),
+				'music_director': album_details.get('music_director', '').strip(),
+				'star_cast': album_details.get('star_cast', '').strip(),
+				'thumbnail_url': thumbnail_url
+			}
+		
+		# Add artists from star_cast
+		star_cast = album_details.get('star_cast', '').strip()
+		if star_cast:
+			# Split by comma and clean up
+			artists = [a.strip() for a in star_cast.split(',') if a.strip()]
+			for artist in artists:
+				self.artists.add((artist, album_name))
+		
+		# Add music director
+		music_director = album_details.get('music_director', '').strip()
+		if music_director:
+			# Split by comma in case of multiple directors
+			directors = [d.strip() for d in music_director.split(',') if d.strip()]
+			for director in directors:
+				self.music_directors.add((director, album_name))
+		
+		# Add songs and singers
+		for song in songs:
+			song_title = song.get('title', '').strip()
+			if not song_title:
+				continue
+			
+			singers = song.get('singers', '').strip()
+			
+			# Get first download link if available
+			links = song.get('links', [])
+			audio_url = links[0].get('url', '') if links else ''
+			
+			self.songs.append({
+				'album_name': album_name,
+				'title': song_title,
+				'singer': singers,
+				'thumbnail_url': thumbnail_url,
+				'audio_url': audio_url
+			})
+			
+			# Add singers
+			if singers:
+				# Split by comma for multiple singers
+				singer_list = [s.strip() for s in singers.split(',') if s.strip()]
+				for singer in singer_list:
+					self.singers.add(singer)
+	
+	def generate_sql_files(self, output_dir: Path | str):
+		"""Generate separate SQL files for each table."""
+		if isinstance(output_dir, str):
+			output_dir = Path(output_dir)
+		
+		output_dir.mkdir(parents=True, exist_ok=True)
+		
+		# Generate albums.sql
+		self._generate_albums_sql(output_dir / 'albums.sql')
+		
+		# Generate songs.sql
+		self._generate_songs_sql(output_dir / 'songs.sql')
+		
+		# Generate artists.sql
+		self._generate_artists_sql(output_dir / 'artists.sql')
+		
+		# Generate singers.sql
+		self._generate_singers_sql(output_dir / 'singers.sql')
+		
+		# Generate music_directors.sql
+		self._generate_music_directors_sql(output_dir / 'music_directors.sql')
+		
+		print(f"\n{'='*70}", file=sys.stderr)
+		print(f"✓ SQL FILES GENERATED", file=sys.stderr)
+		print(f"{'='*70}", file=sys.stderr)
+		print(f"  Albums: {len(self.albums)}", file=sys.stderr)
+		print(f"  Songs: {len(self.songs)}", file=sys.stderr)
+		print(f"  Artists: {len(self.artists)}", file=sys.stderr)
+		print(f"  Singers: {len(self.singers)}", file=sys.stderr)
+		print(f"  Music Directors: {len(self.music_directors)}", file=sys.stderr)
+		print(f"  Output Directory: {output_dir.resolve()}", file=sys.stderr)
+		print(f"{'='*70}\n", file=sys.stderr)
+	
+	def _escape_sql_string(self, value: str) -> str:
+		"""Escape string for SQL INSERT."""
+		if not value:
+			return 'NULL'
+		# Escape single quotes by doubling them
+		escaped = value.replace("'", "''")
+		return f"'{escaped}'"
+	
+	def _generate_albums_sql(self, output_path: Path):
+		"""Generate SQL INSERT statements for albums table."""
+		with open(output_path, 'w', encoding='utf-8') as f:
+			f.write("-- Albums INSERT statements\n")
+			f.write("-- Generated from scraping data\n\n")
+			f.write("SET FOREIGN_KEY_CHECKS=0;\n")
+			f.write("TRUNCATE TABLE albums;\n")
+			f.write("SET FOREIGN_KEY_CHECKS=1;\n\n")
+			
+			for album_name, album_data in sorted(self.albums.items()):
+				title = self._escape_sql_string(album_data['title'])
+				year = album_data['year'] if album_data['year'] else 'NULL'
+				director = self._escape_sql_string(album_data['director'])
+				music_director = self._escape_sql_string(album_data['music_director'])
+				star_cast = self._escape_sql_string(album_data['star_cast'])
+				thumbnail_url = self._escape_sql_string(album_data['thumbnail_url'])
+				
+				sql = f"INSERT IGNORE INTO albums (title, year, director, music_director, star_cast, thumbnail_url) VALUES ({title}, {year}, {director}, {music_director}, {star_cast}, {thumbnail_url});\n"
+				f.write(sql)
+	
+	def _generate_songs_sql(self, output_path: Path):
+		"""Generate SQL INSERT statements for songs table."""
+		with open(output_path, 'w', encoding='utf-8') as f:
+			f.write("-- Songs INSERT statements\n")
+			f.write("-- Generated from scraping data\n\n")
+			f.write("SET FOREIGN_KEY_CHECKS=0;\n")
+			f.write("TRUNCATE TABLE songs;\n")
+			f.write("SET FOREIGN_KEY_CHECKS=1;\n\n")
+			
+			for song_data in self.songs:
+				album_name = self._escape_sql_string(song_data['album_name'])
+				title = self._escape_sql_string(song_data['title'])
+				singer = self._escape_sql_string(song_data['singer'])
+				thumbnail_url = self._escape_sql_string(song_data['thumbnail_url'])
+				audio_url = self._escape_sql_string(song_data['audio_url'])
+				
+				sql = f"INSERT IGNORE INTO songs (album_id, title, singer, thumbnail_url, audio_url) VALUES (COALESCE((SELECT id FROM albums WHERE title = {album_name} LIMIT 1), 1), {title}, {singer}, {thumbnail_url}, {audio_url});\n"
+				f.write(sql)
+	
+	def _generate_artists_sql(self, output_path: Path):
+		"""Generate SQL INSERT statements for artists table."""
+		with open(output_path, 'w', encoding='utf-8') as f:
+			f.write("-- Artists INSERT statements\n")
+			f.write("-- Generated from scraping data\n\n")
+			f.write("SET FOREIGN_KEY_CHECKS=0;\n")
+			f.write("TRUNCATE TABLE artists;\n")
+			f.write("SET FOREIGN_KEY_CHECKS=1;\n\n")
+			
+			for artist_name, album_name in sorted(self.artists):
+				artist = self._escape_sql_string(artist_name)
+				album = self._escape_sql_string(album_name)
+				
+				sql = f"INSERT IGNORE INTO artists (artist_name, album_id, album_name) VALUES ({artist}, COALESCE((SELECT id FROM albums WHERE title = {album} LIMIT 1), 1), {album});\n"
+				f.write(sql)
+	
+	def _generate_singers_sql(self, output_path: Path):
+		"""Generate SQL INSERT statements for singers table."""
+		with open(output_path, 'w', encoding='utf-8') as f:
+			f.write("-- Singers INSERT statements\n")
+			f.write("-- Generated from scraping data\n\n")
+			f.write("SET FOREIGN_KEY_CHECKS=0;\n")
+			f.write("TRUNCATE TABLE singers;\n")
+			f.write("SET FOREIGN_KEY_CHECKS=1;\n\n")
+			
+			for singer_name in sorted(self.singers):
+				singer = self._escape_sql_string(singer_name)
+				sql = f"INSERT IGNORE INTO singers (singer_name) VALUES ({singer});\n"
+				f.write(sql)
+	
+	def _generate_music_directors_sql(self, output_path: Path):
+		"""Generate SQL INSERT statements for music_directors table."""
+		with open(output_path, 'w', encoding='utf-8') as f:
+			f.write("-- Music Directors INSERT statements\n")
+			f.write("-- Generated from scraping data\n\n")
+			f.write("SET FOREIGN_KEY_CHECKS=0;\n")
+			f.write("TRUNCATE TABLE music_directors;\n")
+			f.write("SET FOREIGN_KEY_CHECKS=1;\n\n")
+			
+			for director_name, album_name in sorted(self.music_directors):
+				director = self._escape_sql_string(director_name)
+				album = self._escape_sql_string(album_name)
+				
+				sql = f"INSERT IGNORE INTO music_directors (director_name, album_id, album_name) VALUES ({director}, COALESCE((SELECT id FROM albums WHERE title = {album} LIMIT 1), 1), {album});\n"
+				f.write(sql)
+
+
 def main(argv: list[str] | None = None) -> int:
 	args = parse_args(argv or sys.argv[1:])
 
@@ -870,44 +1214,66 @@ def main(argv: list[str] | None = None) -> int:
 			print(f"✗ CSV file not found: {csv_path}")
 			return 1
 		
-		# Read article URLs from CSV
-		article_urls = []
+		# Read article data (href, image_src, title) from CSV
+		article_data_list = []
 		try:
 			with open(csv_path, 'r', encoding='utf-8') as f:
 				reader = csv.DictReader(f)
 				for row in reader:
 					if 'href' in row:
-						article_urls.append(row['href'])
+						article_data_list.append({
+							'href': row['href'],
+							'image_src': row.get('image_src', ''),
+							'title': row.get('title', '')
+						})
 		except Exception as e:
 			print(f"✗ Error reading CSV: {e}")
 			return 1
 		
-		print(f"Found {len(article_urls)} articles to scrape", file=sys.stderr)
+		print(f"Found {len(article_data_list)} articles to scrape", file=sys.stderr)
+		print(f"Using {args.workers} parallel workers with batch size {args.batch_size}", file=sys.stderr)
 		
-		# Scrape all articles
+		# Scrape all articles in parallel with batching and metadata
 		all_songs = []
-		for i, url in enumerate(article_urls, 1):
-			print(f"Scraping [{i}/{len(article_urls)}]: {url[:60]}...", file=sys.stderr)
-			article_data = scrape_article_details(url, timeout=args.timeout)
+		batch_size = args.batch_size
+		
+		for batch_start in range(0, len(article_data_list), batch_size):
+			batch_end = min(batch_start + batch_size, len(article_data_list))
+			batch_data = article_data_list[batch_start:batch_end]
 			
-			if 'error' not in article_data:
-				all_songs.append(article_data)
-			else:
-				print(f"  ✗ Error: {article_data['error']}", file=sys.stderr)
+			print(f"\n{'='*70}", file=sys.stderr)
+			print(f"Processing batch {batch_start//batch_size + 1}/{(len(article_data_list) + batch_size - 1)//batch_size}", file=sys.stderr)
+			print(f"Articles {batch_start + 1} to {batch_end} of {len(article_data_list)}", file=sys.stderr)
+			print(f"{'='*70}", file=sys.stderr)
+			
+			batch_results = scrape_articles_batch_with_metadata(batch_data, timeout=args.timeout, workers=args.workers)
+			all_songs.extend(batch_results)
 		
 		# Combine all articles while preserving album details for each song
 		all_articles_with_songs = []
+		
+		# Initialize SQL collector if SQL output is requested
+		sql_collector = SQLDataCollector() if args.sql_output else None
 		
 		for article in all_songs:
 			album_details = article.get('album_details', {})
 			thumbnail_url = article.get('thumbnail_url', '')
 			songs = article.get('songs', [])
 			
-			all_articles_with_songs.append({
+			article_data = {
 				'album_details': album_details,
 				'thumbnail_url': thumbnail_url,
 				'songs': songs
-			})
+			}
+			all_articles_with_songs.append(article_data)
+			
+			# Add to SQL collector
+			if sql_collector:
+				sql_collector.add_article_data(article_data)
+		
+		# Generate SQL files if requested
+		if args.sql_output and sql_collector:
+			sql_collector.generate_sql_files(args.sql_output)
 		
 		if args.songs_output:
 			output_file = Path(args.songs_output)
@@ -952,16 +1318,29 @@ def main(argv: list[str] | None = None) -> int:
 			chars = [c.strip() for c in args.scrape_tags.split(',')]
 			tags = generate_tag_list(characters=''.join(chars))
 		
-		print(f"Starting to scrape {len(tags)} tags...", file=sys.stderr)
+		print(f"Starting to scrape {len(tags)} tags with {args.workers} parallel workers...", file=sys.stderr)
+		print(f"{'='*70}", file=sys.stderr)
 		
-		for tag in tags:
-			articles = scrape_all_tag_pages(tag, timeout=args.timeout)
-			all_articles.extend(articles)
-			print(f"✓ {tag}: {len(articles)} articles", file=sys.stderr)
+		# Process tags in batches for better control
+		batch_size = args.batch_size
+		all_articles = []
+		
+		for batch_start in range(0, len(tags), batch_size):
+			batch_end = min(batch_start + batch_size, len(tags))
+			batch_tags = tags[batch_start:batch_end]
+			
+			print(f"\nProcessing tag batch {batch_start//batch_size + 1}/{(len(tags) + batch_size - 1)//batch_size}", file=sys.stderr)
+			print(f"Tags: {', '.join(batch_tags)}", file=sys.stderr)
+			print(f"{'-'*70}", file=sys.stderr)
+			
+			batch_articles = scrape_all_tag_pages_parallel(batch_tags, timeout=args.timeout, workers=args.workers)
+			all_articles.extend(batch_articles)
+		
+		print(f"\n{'='*70}", file=sys.stderr)
 		
 		if args.tags_output:
 			output_file = save_articles_to_csv(all_articles, args.tags_output)
-			print(f"\n✓ Saved {len(all_articles)} total articles to {output_file.resolve()}")
+			print(f"✓ Saved {len(all_articles)} total articles to {output_file.resolve()}", file=sys.stderr)
 		else:
 			print(f"\n✓ Found {len(all_articles)} total articles")
 			for article in all_articles[:5]:  # Show first 5
