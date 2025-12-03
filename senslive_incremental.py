@@ -498,7 +498,13 @@ def extract_songs_from_article(soup: BeautifulSoup) -> list[dict[str, str]]:
             for para in paragraphs:
                 text = para.get_text().strip()
                 
+                # Check for patterns: "01." or "1-" or "1 -" 
+                song_pattern_found = False
+                song_full_title = ""
+                
+                # Pattern 1: "01. Song Name" or "1. Song Name"
                 if any(text.startswith(f'{i:02d}.') for i in range(1, 100)):
+                    song_pattern_found = True
                     song_full_title = text.split('Download')[0].strip()
                     
                     for i in range(1, 100):
@@ -506,7 +512,24 @@ def extract_songs_from_article(soup: BeautifulSoup) -> list[dict[str, str]]:
                         if song_full_title.startswith(prefix):
                             song_full_title = song_full_title[len(prefix):].strip()
                             break
+                
+                # Pattern 2: "1- Song Name" or "1 - Song Name"
+                elif any(text.startswith(f'{i}-') or text.startswith(f'{i} -') for i in range(1, 100)):
+                    song_pattern_found = True
+                    # Remove leading number and dash/hyphen
+                    for i in range(1, 100):
+                        if text.startswith(f'{i}-'):
+                            song_full_title = text[len(f'{i}-'):].strip()
+                            break
+                        elif text.startswith(f'{i} -'):
+                            song_full_title = text[len(f'{i} -'):].strip()
+                            break
                     
+                    # Remove "Download" if present
+                    if 'Download' in song_full_title:
+                        song_full_title = song_full_title.split('Download')[0].strip()
+                
+                if song_pattern_found and song_full_title:
                     song_name = song_full_title
                     singers = ''
                     
@@ -525,6 +548,15 @@ def extract_songs_from_article(soup: BeautifulSoup) -> list[dict[str, str]]:
                         'links': []
                     }
                     songs.append(current_song)
+                
+                # Check for "Singers:-" pattern in the paragraph to extract singers
+                if current_song and 'Singers' in text and ':' in text:
+                    lines = text.split('\n')
+                    for line in lines:
+                        if 'Singers' in line and ':' in line:
+                            singer_part = line.split(':', 1)[1].strip()
+                            if singer_part and not current_song['singers']:
+                                current_song['singers'] = clean_string(singer_part)
                 
                 links = para.find_all('a', href=True)
                 for link in links:
@@ -1227,6 +1259,259 @@ def scrape_article_with_date(article_url: str, timeout: int = DEFAULT_TIMEOUT, m
         return {'error': str(e), 'url': article_url}
 
 
+def run_single_article(
+    article_url: str,
+    sql_output: Path = Path('sql_output'),
+    execute_sql: bool = False,
+    timeout: int = DEFAULT_TIMEOUT
+):
+    """
+    Scrape a single article and insert into database.
+    Checks for duplicates before inserting.
+    Does not filter by date - always processes the article.
+    """
+    logger.info("="*70)
+    logger.info("SINGLE ARTICLE SCRAPING")
+    logger.info("="*70)
+    logger.info(f"Article URL: {article_url}")
+    
+    # Scrape the article without date filtering
+    logger.info("Scraping article...")
+    article_result = scrape_article_details(article_url, timeout=timeout)
+    
+    if not article_result or 'error' in article_result:
+        logger.error(f"Failed to scrape article: {article_result.get('error', 'Unknown error')}")
+        return
+    
+    # Extract data
+    album_details = article_result.get('album_details', {})
+    album_name = album_details.get('album_name', '')
+    
+    # If album_name not found in details, try to extract from page title
+    if not album_name:
+        try:
+            session = create_session()
+            headers = build_headers(article_url, "gzip, deflate")
+            resp = session.get(article_url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            
+            # Try to get from h1.entry-title
+            title_tag = soup.find('h1', class_='entry-title')
+            if title_tag:
+                title_text = title_tag.get_text().strip()
+                # Remove year in parentheses if present: "Album Name (2015)" -> "Album Name"
+                import re
+                album_name = re.sub(r'\s*\(\d{4}\)\s*$', '', title_text).strip()
+                if album_name:
+                    album_details['album_name'] = album_name
+                    article_result['album_details'] = album_details
+                    logger.info(f"Extracted album name from title: {album_name}")
+        except Exception as e:
+            logger.warning(f"Could not extract album name from title: {e}")
+    
+    if not album_name:
+        album_name = album_details.get('album_name', 'Unknown')
+    
+    songs = article_result.get('songs', [])
+    
+    logger.info(f"Album: {album_name}")
+    logger.info(f"Songs found: {len(songs)}")
+    
+    # Create collector and add data
+    collector = SQLDataCollector(incremental_mode=True)
+    collector.add_article_data(article_result)
+    
+    # Generate SQL files
+    sql_output.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Generating SQL files in: {sql_output}")
+    
+    collector.generate_sql_files(sql_output)
+    
+    logger.info(f"Generated SQL for:")
+    logger.info(f"  - Albums: {len(collector.albums)}")
+    logger.info(f"  - Songs: {len(collector.songs)}")
+    logger.info(f"  - Artists: {len(collector.artists)}")
+    logger.info(f"  - Singers: {len(collector.singers)}")
+    logger.info(f"  - Music Directors: {len(collector.music_directors)}")
+    
+    # Execute SQL if requested
+    if execute_sql:
+        logger.info("="*70)
+        logger.info("EXECUTING SQL")
+        logger.info("="*70)
+        
+        from db_utils import execute_sql_files_batch
+        
+        sql_files = [
+            sql_output / 'albums.sql',
+            sql_output / 'songs.sql',
+            sql_output / 'artists.sql',
+            sql_output / 'singers.sql',
+            sql_output / 'music_directors.sql'
+        ]
+        
+        # Filter to existing files
+        existing_files = [f for f in sql_files if f.exists()]
+        
+        if existing_files:
+            try:
+                execute_sql_files_batch(existing_files)
+                logger.info("SQL execution completed successfully!")
+                logger.info("Note: INSERT IGNORE used - duplicates were skipped automatically")
+            except Exception as e:
+                logger.error(f"SQL execution failed: {e}")
+        else:
+            logger.warning("No SQL files found to execute")
+    
+    logger.info("="*70)
+    logger.info("SINGLE ARTICLE SCRAPING COMPLETED")
+    logger.info("="*70)
+
+
+def run_year_load(
+    start_year: int,
+    sql_output: Path = Path('sql_output'),
+    execute_sql: bool = False,
+    workers: int = DEFAULT_WORKERS,
+    batch_size: int = 10,
+    timeout: int = DEFAULT_TIMEOUT
+):
+    """
+    Scrape all articles from all tags starting from a specific year to current year.
+    Only inserts albums that don't already exist in the database.
+    """
+    from datetime import datetime
+    current_year = datetime.now().year
+    
+    logger.info("="*70)
+    logger.info(f"YEAR-BASED LOAD: {start_year} to {current_year}")
+    logger.info("="*70)
+    
+    # Get existing album titles from database for the year range
+    existing_albums = set()
+    try:
+        from db_utils import get_db_connection
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT title FROM albums WHERE year >= %s AND year <= %s", (start_year, current_year))
+            existing_albums = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+        logger.info(f"Found {len(existing_albums)} existing albums from {start_year} to {current_year}")
+    except Exception as e:
+        logger.warning(f"Could not get existing albums: {e}")
+    
+    # Generate all tags
+    tags = generate_tag_list()
+    logger.info(f"Scraping {len(tags)} tags to find albums from {start_year} to {current_year}...")
+    
+    # Scrape all articles from all tags
+    all_articles = scrape_all_tag_pages_parallel(tags, timeout=timeout, workers=workers)
+    logger.info(f"Found {len(all_articles)} total articles from all tags")
+    
+    # Process articles in batches to extract year information
+    logger.info(f"Filtering articles by year range {start_year}-{current_year}...")
+    year_articles = []
+    
+    # Process in smaller batches to show progress
+    batch_size_check = 100
+    total_batches = (len(all_articles) + batch_size_check - 1) // batch_size_check
+    
+    for batch_num in range(total_batches):
+        batch_start = batch_num * batch_size_check
+        batch_end = min(batch_start + batch_size_check, len(all_articles))
+        batch_data = all_articles[batch_start:batch_end]
+        
+        logger.info(f"Checking batch {batch_num + 1}/{total_batches}...")
+        
+        # Scrape each article to get year
+        batch_results = scrape_articles_batch_with_metadata(batch_data, timeout=timeout, workers=workers)
+        
+        for article in batch_results:
+            album_details = article.get('album_details', {})
+            album_name = album_details.get('album_name', '')
+            year_str = album_details.get('year', '').strip()
+            article_year = clean_year(year_str)
+            
+            # Extract album name from title if not in details
+            if not album_name:
+                try:
+                    url = article.get('url', '')
+                    if url:
+                        session = create_session()
+                        headers = build_headers(url, "gzip, deflate")
+                        resp = session.get(url, headers=headers, timeout=timeout)
+                        soup = BeautifulSoup(resp.content, 'html.parser')
+                        title_tag = soup.find('h1', class_='entry-title')
+                        if title_tag:
+                            title_text = title_tag.get_text().strip()
+                            import re
+                            album_name = re.sub(r'\s*\(\d{4}\)\s*$', '', title_text).strip()
+                            if album_name:
+                                album_details['album_name'] = album_name
+                except:
+                    pass
+            
+            # Filter by year range and check if not already exists
+            if article_year and article_year >= start_year and article_year <= current_year and album_name and album_name not in existing_albums:
+                year_articles.append(article)
+                logger.info(f"  ✓ Found: {album_name} ({article_year})")
+    
+    logger.info(f"\nFound {len(year_articles)} new articles from {start_year} to {current_year}")
+    
+    if not year_articles:
+        logger.info("No new articles to process!")
+        return
+    
+    # Generate SQL
+    logger.info("Generating SQL files...")
+    sql_collector = SQLDataCollector(incremental_mode=True)
+    
+    for article in year_articles:
+        sql_collector.add_article_data(article)
+    
+    sql_collector.generate_sql_files(sql_output)
+    
+    logger.info(f"Generated SQL for:")
+    logger.info(f"  - Albums: {len(sql_collector.albums)}")
+    logger.info(f"  - Songs: {len(sql_collector.songs)}")
+    logger.info(f"  - Artists: {len(sql_collector.artists)}")
+    logger.info(f"  - Singers: {len(sql_collector.singers)}")
+    logger.info(f"  - Music Directors: {len(sql_collector.music_directors)}")
+    
+    # Execute SQL if requested
+    if execute_sql:
+        logger.info("="*70)
+        logger.info("EXECUTING SQL")
+        logger.info("="*70)
+        
+        from db_utils import execute_sql_files_batch
+        
+        sql_files = [
+            sql_output / 'albums.sql',
+            sql_output / 'songs.sql',
+            sql_output / 'artists.sql',
+            sql_output / 'singers.sql',
+            sql_output / 'music_directors.sql'
+        ]
+        
+        existing_files = [f for f in sql_files if f.exists()]
+        
+        if existing_files:
+            try:
+                execute_sql_files_batch(existing_files)
+                logger.info("SQL execution completed successfully!")
+                logger.info("Note: INSERT IGNORE used - duplicates were skipped automatically")
+            except Exception as e:
+                logger.error(f"SQL execution failed: {e}")
+        else:
+            logger.warning("No SQL files found to execute")
+    
+    logger.info("="*70)
+    logger.info(f"YEAR RANGE {start_year}-{current_year} LOAD COMPLETED")
+    logger.info("="*70)
+
+
 def run_incremental_load(
     articles_csv: Optional[Path] = None,
     sql_output: Path = Path('sql_output'),
@@ -1430,6 +1715,12 @@ Examples:
   # Incremental load
   python ingestion.py --mode incremental --sql-output sql_output --execute-sql
   
+  # Single article scraping
+  python ingestion.py --mode single --article-url "https://sensongsmp3.live/..." --sql-output sql_output --execute-sql
+  
+  # Year-based load (scrape all tags for specific year, insert only new albums)
+  python ingestion.py --mode year --year 1995 --sql-output sql_output --execute-sql
+  
   # Dry run (generate SQL only)
   python ingestion.py --mode full --sql-output sql_output
         """
@@ -1437,9 +1728,9 @@ Examples:
     
     parser.add_argument(
         "--mode",
-        choices=["full", "incremental"],
+        choices=["full", "incremental", "single", "year"],
         required=True,
-        help="Ingestion mode: full (reload all) or incremental (only new)"
+        help="Ingestion mode: full (reload all), incremental (only new), single (one article), or year (specific year)"
     )
     
     parser.add_argument(
@@ -1494,6 +1785,18 @@ Examples:
     )
     
     parser.add_argument(
+        "--article-url",
+        type=str,
+        help="Single article URL to scrape (for --mode single)"
+    )
+    
+    parser.add_argument(
+        "--year",
+        type=int,
+        help="Start year to scrape from (for --mode year, e.g., 1995 will scrape 1995 to current year)"
+    )
+    
+    parser.add_argument(
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
@@ -1541,6 +1844,28 @@ def main(argv: list[str] | None = None) -> int:
             sql_output=args.sql_output,
             execute_sql=args.execute_sql,
             truncate=args.truncate,
+            workers=args.workers,
+            batch_size=args.batch_size,
+            timeout=args.timeout
+        )
+    elif args.mode == "single":
+        if not args.article_url:
+            logger.error("--article-url is required for single mode")
+            return 1
+        run_single_article(
+            article_url=args.article_url,
+            sql_output=args.sql_output,
+            execute_sql=args.execute_sql,
+            timeout=args.timeout
+        )
+    elif args.mode == "year":
+        if not args.year:
+            logger.error("--year is required for year mode")
+            return 1
+        run_year_load(
+            start_year=args.year,
+            sql_output=args.sql_output,
+            execute_sql=args.execute_sql,
             workers=args.workers,
             batch_size=args.batch_size,
             timeout=args.timeout
